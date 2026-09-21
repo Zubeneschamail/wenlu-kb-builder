@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+models/
+output/
+*.tmp
+*.wlkb
+*.wenlukb
+*.wlkb.lock
+*.wenlukb.lock
+*.report.json
+.env
+.env.*
