@@ -18,6 +18,24 @@
 
 模型已就绪后，构建和查询不会访问网络；资料不会上传。默认 CPU 推理，限制为 2 个计算线程，可在编码器初始化参数中调整。
 
+### 模型下载超时：使用离线模型包
+
+从 [GitHub Release 下载离线模型包](https://github.com/Zubeneschamail/wenlu-kb-builder/releases/tag/offline-model-bge-zh-v1)，选择附件 `wenlu-kb-models-offline.zip`（约 16 MB）。源码 ZIP 不包含模型，需要单独下载这个附件。
+
+将模型 ZIP 解压到 `start.cmd` 所在目录，目录结构应为：
+
+```text
+start.cmd
+models/bge-small-zh-v1.5/tokenizer.json
+models/bge-small-zh-v1.5/config.json
+models/bge-small-zh-v1.5/onnx/model_quantized.onnx
+models/bge-small-zh-v1.5/LICENSE.txt
+```
+
+已安装依赖的电脑可直接打开工具，点击「生成知识包」。新电脑仍需 Python 3.12，并运行 `setup.cmd` 安装依赖；提前解压模型后，脚本会校验本地文件并跳过模型下载。离线模型包不包含 Python 和依赖安装包。
+
+Release 同时提供 `.sha256` 校验文件。ZIP 的 SHA256 为 `409a0f343cfaabb484053027593278dbbd852eba21891ab3cd2b6e754c2da1c0`；模型文件还会按工具内置的固定 SHA256 校验。
+
 ## 命令行与自动化
 
 在 PowerShell 中先执行 `Set-Location E:\wenlu-kb-builder`。
