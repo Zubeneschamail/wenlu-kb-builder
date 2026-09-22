@@ -141,6 +141,30 @@ class BuilderTests(unittest.TestCase):
         _, files, _ = discover(self.source)
         self.assertEqual(files, [self.doc])
 
+    def test_source_code_files_are_discovered_and_keep_line_ranges(self):
+        vue = self.source / 'src' / 'App.vue'
+        vue.parent.mkdir()
+        vue.write_text('<template>\n  <Panel />\n</template>\n\n'
+                       '<script setup lang="ts">\nconst title = "订单"\n</script>\n',
+                       encoding='utf-8')
+        (self.source / 'main.cpp').write_text(
+            '#include <string>\n\nint main() { return 0; }\n', encoding='utf-8')
+        (self.source / 'client.js').write_text(
+            'export function load() {\n  return fetch("/api");\n}\n', encoding='utf-8')
+        (self.source / 'Program.cs').write_text(
+            'class Program {\n    static void Main() { }\n}\n', encoding='utf-8')
+
+        _, files, _ = discover(self.source)
+        self.assertEqual([path.name for path in files],
+                         ['Program.cs', 'client.js', 'main.cpp', 'project.md', 'App.vue'])
+        blocks = parse_document(vue)
+        self.assertEqual(blocks[0].line_start, 1)
+        self.assertEqual(blocks[0].line_end, 3)
+        self.assertIn('Panel', blocks[0].text)
+        self.assertEqual(blocks[1].line_start, 5)
+        self.assertEqual(blocks[1].line_end, 7)
+        self.assertIn('订单', blocks[1].text)
+
     def test_docx_extracts_heading_and_text(self):
         docx = self.source / 'resume.docx'
         xml = ('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'

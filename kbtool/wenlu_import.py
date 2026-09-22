@@ -76,11 +76,11 @@ def import_package(package, cancel=None, progress=print, data=None):
     path = Path(package).resolve(strict=True)
     if path.suffix.lower() != '.wlkb':
         raise ValueError('请选择已生成的 .wlkb 知识包。')
-    inspect_package(path)
+    inspect_package(path, cancel=cancel)
     check_cancel(cancel)
     data = Path(data) if data is not None else data_directory()
     # Local handoff never uses network proxies or a remote endpoint supplied by metadata.
-    with httpx.Client(trust_env=False, timeout=35) as client:
+    with httpx.Client(trust_env=False, timeout=610) as client:
         endpoint = live_endpoint(client, data)
         if endpoint is None:
             command = find_launcher(data)

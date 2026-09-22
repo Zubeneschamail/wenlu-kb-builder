@@ -1,27 +1,37 @@
 """Parsers, atomic SQLite packages and hybrid retrieval."""
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import json
 import os
 import re
 import sqlite3
-import tempfile
-import uuid
 import zipfile
 from xml.etree import ElementTree as ET
 
-import numpy as np
-
 from .embedding import check_cancel, sha256
+from .storage import MAX_CHUNKS, MAX_SIZE, MAX_MANIFEST, semantic_top
 
-SUPPORTED = {'.txt', '.md', '.rst', '.docx', '.pdf'}
+DOCUMENT_EXTENSIONS = {'.txt', '.md', '.rst', '.docx', '.pdf'}
+# Source files are indexed as text.  No language-specific parser is needed
+# for retrieval; retaining the original path and line ranges is more useful
+# than trying to reduce code to a generic document representation.
+CODE_EXTENSIONS = {
+    '.vue', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
+    '.html', '.htm', '.css', '.scss', '.less',
+    '.c', '.h', '.cc', '.cpp', '.cxx', '.hh', '.hpp', '.hxx',
+    '.cs', '.java', '.kt', '.kts', '.go', '.rs', '.py', '.rb', '.php',
+    '.swift', '.dart', '.lua', '.sh', '.bash', '.zsh', '.fish',
+    '.ps1', '.bat', '.cmd', '.sql', '.proto', '.graphql', '.gql',
+    '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg',
+}
+SUPPORTED = DOCUMENT_EXTENSIONS | CODE_EXTENSIONS
 IGNORED = {'.git', '.venv', 'node_modules', '__pycache__', 'models', 'output',
-           'build', 'dist', 'evaluation', 'tests'}
+           'build', 'dist', 'bin', 'obj', 'coverage', 'target', 'evaluation', 'tests'}
 PRIVATE = {'credentials', 'secrets', 'credentials.txt', 'secrets.txt'}
 FORMAT = 'wenlu-kb-sqlite-v1'
-MAX_CHUNKS = 50000
+MAX_FILES = 100_000
+MAX_SKIPPED_DETAILS = 1000
 
 
 def digest(text):
@@ -129,9 +139,15 @@ def discover(source, cancel=None):
     source = Path(source).resolve(strict=True)
     if source.is_file():
         if source.suffix.lower() not in SUPPORTED:
-            raise ValueError('支持 TXT、Markdown、RST、DOCX 和可提取文字的 PDF。')
+            raise ValueError('支持 TXT、Markdown、RST、DOCX、PDF 和常见源码文件。')
         return source.parent, [source], []
     files, skipped = [], []
+    skipped_count = 0
+    def skip(path, reason):
+        nonlocal skipped_count
+        skipped_count += 1
+        if len(skipped) < MAX_SKIPPED_DETAILS:
+            skipped.append({'path': path.relative_to(source).as_posix(), 'reason': reason})
     for current, directories, names in os.walk(source, followlinks=False):
         check_cancel(cancel)
         directories[:] = sorted(d for d in directories if d.lower() not in IGNORED
@@ -140,15 +156,18 @@ def discover(source, cancel=None):
         for name in sorted(names):
             path = Path(current) / name
             if path.is_symlink() or name.startswith('.') or name.lower() in PRIVATE:
-                skipped.append({'path': path.relative_to(source).as_posix(), 'reason': '隐藏、私密或链接文件'})
+                skip(path, '隐藏、私密或链接文件')
             elif path.suffix.lower() in SUPPORTED:
                 files.append(path)
-                if len(files) > 1000:
-                    raise ValueError('单个知识包最多 1000 个文件，请按客户或项目拆分。')
+                if len(files) > MAX_FILES:
+                    raise ValueError('单个知识包最多 10 万个文件，请按客户或项目拆分。')
             else:
-                skipped.append({'path': path.relative_to(source).as_posix(), 'reason': '不支持的文件类型'})
+                skip(path, '不支持的文件类型')
     if not files:
         raise ValueError('没有找到支持的资料文件。evaluation、tests 等目录默认不入库。')
+    if skipped_count > len(skipped):
+        skipped.append({'path': '', 'reason': '其余跳过文件仅记录数量，避免清单膨胀',
+                        'omitted_count': skipped_count - len(skipped)})
     return source, files, skipped
 
 
@@ -201,11 +220,18 @@ def terms(text):
 
 def open_package(path):
     path = Path(path).resolve(strict=True)
+    if path.stat().st_size > MAX_SIZE:
+        raise ValueError('知识包超过 8 GiB，请按项目拆分。')
     connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
     connection.row_factory = sqlite3.Row
     try:
         connection.execute('PRAGMA query_only=ON')
-        manifest = json.loads(connection.execute("SELECT value FROM metadata WHERE key='manifest'").fetchone()[0])
+        connection.execute('PRAGMA cache_size=-8192')
+        connection.execute('PRAGMA temp_store=FILE')
+        row = connection.execute("SELECT value FROM metadata WHERE key='manifest' AND length(CAST(value AS BLOB))<=?", (MAX_MANIFEST,)).fetchone()
+        if not row:
+            raise ValueError('知识包清单缺失或超过 64 MiB。')
+        manifest = json.loads(row[0])
         if manifest.get('format') != FORMAT:
             raise ValueError('不支持的知识包格式。')
         return connection, manifest
@@ -214,160 +240,29 @@ def open_package(path):
         raise
 
 
-def inspect_package(path):
+def inspect_package(path, cancel=None):
     connection, manifest = open_package(path)
     try:
+        connection.set_progress_handler(lambda: int(bool(cancel and cancel.is_set())), 1000)
+        check_cancel(cancel)
         if connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
             raise ValueError('知识包完整性检查失败。')
         count = connection.execute('SELECT count(*) FROM chunks').fetchone()[0]
-        if count != manifest['chunk_count']:
+        if count != manifest['chunk_count'] or not 1 <= count <= MAX_CHUNKS:
             raise ValueError('片段数量与清单不一致。')
         return manifest
+    except sqlite3.OperationalError:
+        check_cancel(cancel)
+        raise
     finally:
         connection.close()
 
 
 def build(source, output, customer_id, encoder, name='客户知识库', chunk_tokens=320,
           overlap=48, cancel=None, progress=print, urls=None):
-    from .web_sources import fetch_documents, normalize_urls
-    urls = normalize_urls(urls)
-    if not source and not urls:
-        raise ValueError('请选择本地资料或填写网页链接。')
-    if not customer_id.strip() or not name.strip():
-        raise ValueError('客户 ID 和知识库名称不能为空。')
-    if not 64 <= chunk_tokens <= 440 or not 0 <= overlap < chunk_tokens // 2:
-        raise ValueError('切块参数无效。')
-    output = Path(output).resolve()
-    if output.suffix.lower() != '.wlkb':
-        raise ValueError('输出文件扩展名必须为 .wlkb。')
-    output.parent.mkdir(parents=True, exist_ok=True)
-    lock = output.with_suffix('.wlkb.lock')
-    try:
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError as exc:
-        raise ValueError('该输出正在构建；若上次进程异常退出，请确认无构建任务后移除对应 .lock 文件。') from exc
-    os.close(descriptor)
-    temporary = None
-    try:
-        base, files, skipped = discover(source, cancel) if source else (None, [], [])
-        documents, chunks, errors = [], [], []
-        for index, path in enumerate(files, 1):
-            check_cancel(cancel)
-            relative = path.relative_to(base).as_posix()
-            progress(f'正在解析：{relative}')
-            try:
-                before = sha256(path)
-                parsed = parse_document(path, cancel)
-                if sha256(path) != before:
-                    raise ValueError('读取过程中资料发生变化，请重试。')
-                parts = make_chunks(parsed, relative, encoder, chunk_tokens, overlap)
-                if not parts:
-                    raise ValueError('文件没有可索引正文。')
-                documents.append({'source': relative, 'sha256': before, 'chunks': len(parts),
-                                  'location_kind': 'page_extracted_lines' if path.suffix.lower() == '.pdf'
-                                  else 'extracted_lines' if path.suffix.lower() == '.docx' else 'source_lines'})
-                chunks.extend(parts)
-                if len(chunks) > MAX_CHUNKS:
-                    raise ValueError(f'片段总数超过 {MAX_CHUNKS}，请拆分。')
-                progress(f'解析完成 {index}/{len(files)}：{relative}')
-            except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
-                errors.append({'source': relative, 'error': str(exc)})
-        if errors:
-            raise ValueError('存在无法完整处理的资料，未发布知识包：\n' + json_text(errors))
-        sources = {doc['source'] for doc in documents}
-        for page in fetch_documents(urls, cancel, progress) if urls else ():
-            if page.source in sources:
-                raise ValueError('网页来源与本地文件重名，请重命名本地 web 目录后重试。')
-            parts = make_chunks(text_blocks(page.text, page.metadata['title']), page.source,
-                                encoder, chunk_tokens, overlap)
-            if not parts:
-                raise ValueError('网页没有可索引正文：' + page.metadata['source_url'])
-            documents.append(dict(page.metadata, source=page.source, sha256=digest(page.text), chunks=len(parts)))
-            chunks.extend(parts)
-            if len(chunks) > MAX_CHUNKS:
-                raise ValueError(f'片段总数超过 {MAX_CHUNKS}，请拆分。')
-        check_cancel(cancel)
-        # Capture time describes this snapshot, but is not a content/configuration change.
-        stable_documents = [{k: v for k, v in doc.items() if k != 'fetched_at'} for doc in documents]
-        fingerprint = digest(json_text({'documents': stable_documents, 'model': encoder.signature,
-                                       'chunk_tokens': chunk_tokens, 'overlap': overlap,
-                                       'name': name, 'customer_id': customer_id, 'pipeline_version': 1}))
-        previous, cached = None, {}
-        if output.exists():
-            connection, previous = open_package(output)
-            try:
-                if previous['customer_id'] != customer_id:
-                    raise ValueError('该输出属于其他客户，拒绝覆盖。请选择新的输出文件。')
-                if previous['fingerprint'] == fingerprint:
-                    progress('输入与构建配置未变化，保留现有知识包。')
-                    return dict(previous, unchanged=True)
-                if previous['embedding'] == encoder.signature:
-                    for row in connection.execute('SELECT content_hash, vector FROM chunks'):
-                        vector = np.frombuffer(row['vector'], dtype='<f4').copy()
-                        if vector.shape == (encoder.dimension,) and np.isfinite(vector).all():
-                            cached[row['content_hash']] = vector
-            finally:
-                connection.close()
-        missing = {item['content_hash']: item['embedding_text'] for item in chunks
-                   if item['content_hash'] not in cached}
-        progress(f'共 {len(chunks)} 个片段；需生成 {len(missing)} 个不同向量。')
-        vectors = encoder.encode(list(missing.values()), cancel=cancel, progress=progress)
-        cached.update(zip(missing, vectors))
-        manifest = {
-            'format': FORMAT, 'package_id': previous['package_id'] if previous else str(uuid.uuid4()),
-            'version': previous['version'] + 1 if previous else 1,
-            'customer_id': customer_id, 'name': name, 'fingerprint': fingerprint,
-            'built_at': datetime.now(timezone.utc).isoformat(), 'embedding': encoder.signature,
-            'chunking': {'tokens': chunk_tokens, 'overlap': overlap, 'pipeline_version': 1},
-            'documents': documents, 'skipped': skipped, 'chunk_count': len(chunks),
-            'new_vectors': len(missing), 'reused_chunks': sum(c['content_hash'] not in missing for c in chunks),
-            'keyword_tokenizer': 'chinese-bigram-ascii-v1',
-            'limitations': ['无 OCR；含无文字页的 PDF 拒绝发布', 'DOCX 行号为提取正文行号',
-                            '原文和向量未加密，校验不等于发行签名', '不自动生成个人经历或回答',
-                            '需使用支持 .wlkb 知识包的闻录版本'],
-        }
-        if urls:
-            manifest['limitations'].append('网页为抓取时的正文快照；动态页面可通过后台浏览器加载，不登录、不自动更新；行号为提取正文行号')
-        progress('写入知识包…')
-        handle, temp_name = tempfile.mkstemp(prefix=output.name + '.', suffix='.tmp', dir=output.parent)
-        os.close(handle)
-        temporary = Path(temp_name)
-        connection = sqlite3.connect(temporary)
-        try:
-            connection.executescript('''
-                CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE chunks(id TEXT PRIMARY KEY, source TEXT, section TEXT, page INTEGER,
-                    line_start INTEGER, line_end INTEGER, text TEXT, content_hash TEXT, vector BLOB);
-                CREATE VIRTUAL TABLE keywords USING fts5(terms, tokenize='unicode61');
-            ''')
-            connection.execute('INSERT INTO metadata VALUES (?,?)', ('manifest', json_text(manifest)))
-            for item in chunks:
-                check_cancel(cancel)
-                row = connection.execute('INSERT INTO chunks VALUES (?,?,?,?,?,?,?,?,?)',
-                    (item['id'], item['source'], item['section'], item['page'], item['line_start'],
-                     item['line_end'], item['text'], item['content_hash'],
-                     np.asarray(cached[item['content_hash']], dtype='<f4').tobytes()))
-                connection.execute('INSERT INTO keywords(rowid,terms) VALUES (?,?)',
-                                   (row.lastrowid, ' '.join(terms(item['embedding_text']))))
-            connection.commit()
-        finally:
-            connection.close()
-        inspect_package(temporary)
-        check_cancel(cancel)
-        temporary.replace(output)
-        temporary = None
-        # Report is derived from the package; package publication is the authoritative result.
-        report = dict(manifest, package_sha256=sha256(output))
-        try:
-            output.with_suffix('.report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-        except OSError as exc:
-            progress(f'知识包已生成，但外部报告写入失败：{exc}；可以用 inspect 查看包内报告。')
-        progress(f'构建完成：{output.name}，版本 {manifest["version"]}')
-        return manifest
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        lock.unlink(missing_ok=True)
+    from .build_pipeline import build as streamed_build
+    return streamed_build(source, output, customer_id, encoder, name, chunk_tokens,
+                          overlap, cancel, progress, urls)
 
 
 def search(package, query, encoder, top_k=5, mode='hybrid', customer_id=None, cancel=None):
@@ -381,20 +276,12 @@ def search(package, query, encoder, top_k=5, mode='hybrid', customer_id=None, ca
             raise ValueError('客户 ID 与知识包不匹配。')
         if manifest['embedding'] != encoder.signature:
             raise ValueError('查询模型与知识包模型不匹配，请使用同一模型版本。')
-        rows = connection.execute('SELECT rowid,* FROM chunks ORDER BY rowid').fetchall()
-        if not rows or len(rows) > MAX_CHUNKS:
+        if not 1 <= manifest['chunk_count'] <= MAX_CHUNKS:
             raise ValueError('知识包为空或超出片段限制。')
-        rowmap = {row['rowid']: row for row in rows}
         semantic, keyword, similarities = [], [], {}
         if mode != 'keyword':
-            matrix = np.stack([np.frombuffer(row['vector'], dtype='<f4') for row in rows])
-            if matrix.shape != (len(rows), encoder.dimension) or not np.isfinite(matrix).all():
-                raise ValueError('知识包向量损坏。')
             query_vector = encoder.encode([query], query=True, cancel=cancel)[0]
-            scores = matrix @ query_vector
-            order = np.argsort(-scores, kind='stable')[:max(20, top_k)]
-            semantic = [rows[i]['rowid'] for i in order]
-            similarities = {rows[i]['rowid']: float(scores[i]) for i in order}
+            semantic, similarities = semantic_top(connection, query_vector, max(20, top_k), lambda: check_cancel(cancel))
         if mode != 'semantic':
             tokens = terms(query)[:96]
             if tokens:
@@ -411,7 +298,7 @@ def search(package, query, encoder, top_k=5, mode='hybrid', customer_id=None, ca
         results = []
         web_sources = {doc['source']: doc for doc in manifest.get('documents', []) if doc.get('source_url')}
         for row_id in order:
-            row = rowmap[row_id]
+            row = connection.execute('SELECT * FROM chunks WHERE rowid=?', (row_id,)).fetchone()
             item = {key: row[key] for key in ('id', 'source', 'section', 'page', 'line_start', 'line_end', 'text')}
             if row['source'] in web_sources:
                 doc = web_sources[row['source']]

@@ -228,7 +228,16 @@ class Application:
         self.model_label.configure(fg='#15803d' if ready else ui.MUTED)
 
     def pick_file(self):
-        value = filedialog.askopenfilename(parent=self.root, title='选择资料文件', filetypes=[('支持的资料', '*.txt *.md *.rst *.pdf *.docx')])
+        value = filedialog.askopenfilename(
+            parent=self.root,
+            title='选择资料文件',
+            filetypes=[('支持的资料',
+                        '*.txt *.md *.rst *.pdf *.docx *.vue *.js *.jsx *.mjs *.cjs '
+                        '*.ts *.tsx *.html *.htm *.css *.scss *.less *.c *.h *.cc '
+                        '*.cpp *.cxx *.hh *.hpp *.hxx *.cs *.java *.kt *.kts *.go '
+                        '*.rs *.py *.rb *.php *.swift *.dart *.lua *.sh *.bash *.zsh '
+                        '*.fish *.ps1 *.bat *.cmd *.sql *.proto *.graphql *.gql *.xml '
+                        '*.yaml *.yml *.toml *.ini *.cfg')])
         if value:
             self.source.set(value)
 
