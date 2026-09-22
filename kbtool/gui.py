@@ -12,6 +12,7 @@ import webbrowser
 from . import ui
 from .scrollbars import SlimScrollbar
 from .core import build, search
+from .web_sources import normalize_urls
 from .embedding import Cancelled, DEFAULT_MODEL_DIR, Encoder, FILES, ROOT, prepare_model, sha256
 
 OFFLINE_RELEASE = 'https://github.com/Zubeneschamail/wenlu-kb-builder/releases/tag/offline-model-bge-zh-v1'
@@ -26,6 +27,7 @@ class Application:
         self.busy = self.closed = False
         self.actions, self.controls = [], []
         self.source = tk.StringVar()
+        self.source_mode = 'local'
         self.output = tk.StringVar(value=str(ROOT / 'output' / 'customer.wlkb'))
         self.customer = tk.StringVar(value='customer-001')
         self.name = tk.StringVar(value='客户知识库')
@@ -63,7 +65,17 @@ class Application:
         ui.label(header, '闻录', size=10, color=ui.MUTED).pack(side='right')
 
         form = self.card(page, row=1)
-        self.heading(form, '生成知识包', '选择资料，生成 .wlkb 文件')
+        source_header = tk.Frame(form, bg=ui.SURFACE)
+        source_header.pack(fill='x')
+        ui.label(source_header, '生成知识包', size=10, color=ui.TEXT, bold=True).pack(side='left')
+        self.web_mode_button = self.button(source_header, '网页链接', lambda: self.select_source_mode('web'))
+        self.web_mode_button.pack(side='right', padx=(6, 0))
+        self.local_mode_button = self.button(source_header, '本地资料', lambda: self.select_source_mode('local'))
+        self.local_mode_button.pack(side='right')
+        for button, mode in ((self.local_mode_button, 'local'), (self.web_mode_button, 'web')):
+            button.configure(pady=3)
+            button.bind('<Leave>', lambda _, b=button, m=mode: b.configure(
+                bg=ui.HOVER if self.source_mode == m else ui.BG))
         fields = tk.Frame(form, bg=ui.SURFACE)
         fields.pack(fill='x', pady=(12, 0))
         fields.columnconfigure(0, minsize=78)
@@ -79,7 +91,8 @@ class Application:
         ui.label(metadata, '知识库名称', size=9).grid(row=0, column=1, padx=(20, 12))
         self.entry(metadata, self.name, width=16).grid(row=0, column=2, sticky='ew')
 
-        ui.label(fields, '资料位置', size=9).grid(row=1, column=0, sticky='w')
+        self.source_label = ui.label(fields, '资料位置', size=9)
+        self.source_label.grid(row=1, column=0, sticky='w')
         self.source_entry = self.entry(fields, self.source)
         self.source_entry.grid(row=1, column=1, sticky='ew', pady=(0, 8))
         choices = tk.Frame(fields, bg=ui.SURFACE)
@@ -88,6 +101,20 @@ class Application:
         self.button(choices, '文件', self.pick_file).grid(row=0, column=0, sticky='nsew', padx=(0, 4))
         self.button(choices, '文件夹', self.pick_folder).grid(row=0, column=1, sticky='nsew', padx=(4, 0))
         choices.rowconfigure(0, weight=1)
+        self.local_choices = choices
+        self.web_input = tk.Frame(fields, bg=ui.SURFACE)
+        self.web_input.grid(row=1, column=1, columnspan=2, sticky='ew', pady=(0, 8))
+        self.url_text = tk.Text(self.web_input, height=2, width=1, wrap='char',
+                                font=(ui.FONT, 9), bg=ui.SURFACE, fg=ui.TEXT,
+                                bd=0, highlightthickness=1, highlightbackground=ui.BORDER,
+                                highlightcolor=ui.ACCENT, padx=9, pady=6, undo=True)
+        self.url_text.pack(fill='x')
+        self.url_scrollbar = SlimScrollbar(self.url_text, overlay_parent=self.web_input)
+        self.controls.append(self.url_text)
+        self.url_text.bind('<Tab>', lambda _: (self.output_entry.focus_set(), 'break')[1])
+        ui.label(self.web_input, '每行一个网址，最多 50 个；动态页面自动通过浏览器加载。', size=9, color=ui.MUTED).pack(anchor='w', pady=(4, 0))
+        self.web_input.grid_remove()
+        self.local_mode_button.configure(bg=ui.HOVER, fg=ui.ACCENT)
 
         ui.label(fields, '保存位置', size=9).grid(row=2, column=0, sticky='w')
         self.output_entry = self.entry(fields, self.output)
@@ -117,7 +144,12 @@ class Application:
         ui.StatusLine(progress, self.status).pack(side='left', fill='x', expand=True)
 
         retrieval = self.card(page, row=2, top=12)
-        self.heading(retrieval, '检索验证', '查看匹配片段与来源')
+        retrieval_heading = tk.Frame(retrieval, bg=ui.SURFACE)
+        retrieval_heading.pack(fill='x')
+        ui.label(retrieval_heading, '检索验证', size=10, color=ui.TEXT, bold=True).pack(side='left')
+        self.import_button = self.button(retrieval_heading, '一键导入闻录', self.import_to_wenlu)
+        self.import_button.configure(pady=3)
+        self.import_button.pack(side='right')
         query_row = tk.Frame(retrieval, bg=ui.SURFACE)
         query_row.pack(fill='x', pady=(12, 10))
         self.button(query_row, '打开知识包', self.pick_package).pack(side='right', padx=(8, 0))
@@ -133,7 +165,7 @@ class Application:
         self.set_results('输入问题，检索当前知识包。\n\n已有知识包可直接打开，无需源文件。', empty=True)
 
     def card(self, parent, row, top=0):
-        border = tk.Frame(parent, bg=ui.SURFACE, bd=0, highlightbackground=ui.BORDER, highlightthickness=1)
+        border = tk.Frame(parent, bg=ui.SURFACE, bd=0, highlightbackground=ui.BORDER, highlightcolor=ui.BORDER, highlightthickness=1)
         border.grid(row=row, column=0, sticky='nsew', pady=(top, 0))
         content = tk.Frame(border, bg=ui.SURFACE, padx=16, pady=14)
         content.pack(fill='both', expand=True)
@@ -200,6 +232,28 @@ class Application:
         if value:
             self.source.set(value)
 
+    def select_source_mode(self, mode):
+        if self.busy:
+            return
+        self.source_mode = mode
+        web = mode == 'web'
+        self.source_label.configure(text='网页链接' if web else '资料位置')
+        if web:
+            self.source_entry.grid_remove()
+            self.local_choices.grid_remove()
+            self.web_input.grid()
+            self.root.minsize(860, 740)
+            self.url_text.focus_set()
+        else:
+            self.web_input.grid_remove()
+            self.source_entry.grid()
+            self.local_choices.grid()
+            self.root.minsize(860, 680)
+            self.source_entry.focus_set()
+        for button, selected in ((self.local_mode_button, not web), (self.web_mode_button, web)):
+            button.configure(bg=ui.HOVER if selected else ui.BG, fg=ui.ACCENT if selected else ui.MUTED)
+        self.status.set('粘贴公开网页链接后生成知识包；再次生成会重新抓取。' if web else '选择资料后，开始生成知识包。')
+
     def pick_folder(self):
         value = filedialog.askdirectory(parent=self.root, title='选择资料文件夹')
         if value:
@@ -230,6 +284,9 @@ class Application:
         for control in self.actions + self.controls:
             control.configure(state='disabled')
         self.cancel_button.configure(state='normal')
+        if kind == 'import':
+            # The receiver may already have committed; cancellation cannot roll it back.
+            self.cancel_button.configure(state='disabled')
         self.set_progress(title)
         self.status.set(title + '…')
         self.append('\n' + time.strftime('%H:%M:%S') + '  ' + title)
@@ -259,17 +316,21 @@ class Application:
     def update_progress(self, text):
         if self.cancel.is_set():
             return
-        match = re.search(r'^(解析完成|向量化：)\s*(\d+)/(\d+)', text)
+        match = re.search(r'^(解析完成|抓取完成|向量化：)\s*(\d+)/(\d+)', text)
         download = re.search(r'：([\d.]+) MB / ([\d.]+) MB', text)
         if match:
             done, total = int(match[2]), int(match[3])
-            phase = '解析资料' if match[1] == '解析完成' else '生成向量'
+            phase = {'解析完成': '解析资料', '抓取完成': '抓取网页', '向量化：': '生成向量'}[match[1]]
             self.set_progress(phase, done / total if total else 0, f'{done} / {total} · {done / max(total, 1):.0%}')
         elif download:
             done, total = float(download[1]), float(download[2])
             self.set_progress('下载模型', done / total if total else None, f'{done:g} / {total:g} MB')
         elif text.startswith('下载模型文件'):
             self.set_progress('下载模型')
+        elif text.startswith('正在渲染网页'):
+            self.set_progress('加载动态网页', detail='等待网页正文')
+        elif text.startswith('正在抓取') and self.phase.get() != '抓取网页':
+            self.set_progress('抓取网页', 0, '正在连接网页')
         elif text.startswith('正在解析') and self.phase.get() != '解析资料':
             self.set_progress('解析资料', 0, '正在读取资料')
         elif text.startswith('已校验'):
@@ -301,15 +362,24 @@ class Application:
         if self.busy:
             return
         source, output, customer, name = self.source.get().strip(), self.output.get().strip(), self.customer.get().strip(), self.name.get().strip()
-        if not source or not output or not customer or not name:
+        urls = []
+        if self.source_mode == 'web':
+            source = None
+            try:
+                urls = normalize_urls(self.url_text.get('1.0', 'end'))
+            except ValueError as exc:
+                messagebox.showerror('网页地址有误', str(exc), parent=self.root)
+                return
+        if (not source and not urls) or not output or not customer or not name:
             messagebox.showerror('信息不完整', '请填写客户 ID、名称、资料和输出位置。', parent=self.root)
             return
         if Path(output).suffix.lower() != '.wlkb':
             messagebox.showerror('知识包格式错误', '输出知识包的后缀必须为 .wlkb。', parent=self.root)
             return
         def operation():
-            result = build(source, output, customer, self.get_encoder(), name=name, cancel=self.cancel, progress=self.log)
-            return f'知识包已生成 · {result["chunk_count"]} 个片段 · 版本 {result["version"]}\n{output}'
+            result = build(source, output, customer, self.get_encoder(), name=name, cancel=self.cancel, progress=self.log, urls=urls)
+            state = '内容未变化，保留原知识包' if result.get('unchanged') else '知识包已生成'
+            return f'{state} · {result["chunk_count"]} 个片段 · 版本 {result["version"]}\n{output}'
         self.run(operation, '生成知识包', 'build')
 
     def lookup(self):
@@ -336,9 +406,24 @@ class Application:
             sections = [f'找到 {len(result["matches"])} 个相关片段 · 客户 {result["customer_id"]}']
             for i, item in enumerate(result['matches'], 1):
                 location = f'第 {item["page"]} 页，' if item['page'] else ''
-                sections.append(f'[{i}] {item["section"]}\n{item["source"]} · {location}行 {item["line_start"]}—{item["line_end"]}\n{item["text"]}')
+                source = item.get('source_url', item['source'])
+                snapshot = f'\n抓取时间：{item["fetched_at"]}' if item.get('fetched_at') else ''
+                sections.append(f'[{i}] {item["section"]}\n{source} · {location}行 {item["line_start"]}—{item["line_end"]}{snapshot}\n{item["text"]}')
             return '\n\n'.join(sections) + '\n\n' + result['note']
         self.run(operation, '检索知识包', 'search')
+
+    def import_to_wenlu(self):
+        if self.busy:
+            return
+        path = Path(self.output.get().strip())
+        if path.suffix.lower() != '.wlkb' or not path.is_file():
+            messagebox.showerror('知识包未就绪', '请先生成知识包，或点击「打开知识包」选择已有 .wlkb 文件。', parent=self.root)
+            return
+        def operation():
+            from .wenlu_import import import_package
+            result = import_package(path, progress=self.log)
+            return f'已导入闻录：{result["name"]}\n知识包已复制到闻录资料目录，并启用参考资料。\n{result["path"]}'
+        self.run(operation, '导入闻录', 'import')
 
     def cancel_task(self):
         if self.busy:
@@ -371,7 +456,7 @@ class Application:
                 elif event in ('error', 'cancelled'):
                     title = '任务失败' if event == 'error' else '任务已取消'
                     self.set_progress(title, self.spinner.value, detail='未完成', state=event)
-                    self.status.set('模型下载超时，可使用「离线模型包」。' if 'timed out' in value.lower() else value)
+                    self.status.set('模型下载超时，可使用「离线模型包」。' if self.operation_kind == 'model' and 'timed out' in value.lower() else value)
                     self.append(('错误：' if event == 'error' else '已取消：') + value)
                     if self.operation_kind == 'search':
                         self.set_results(title + '，请查看运行记录。', empty=True)
@@ -400,6 +485,9 @@ class Application:
 
     def close(self):
         if self.busy:
+            if self.operation_kind == 'import':
+                self.status.set('正在等待闻录确认，请导入结束后关闭窗口。')
+                return
             self.cancel_task()
             self.status.set('正在取消，请任务结束后关闭窗口。')
             return

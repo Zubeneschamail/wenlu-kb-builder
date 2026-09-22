@@ -228,7 +228,11 @@ def inspect_package(path):
 
 
 def build(source, output, customer_id, encoder, name='客户知识库', chunk_tokens=320,
-          overlap=48, cancel=None, progress=print):
+          overlap=48, cancel=None, progress=print, urls=None):
+    from .web_sources import fetch_documents, normalize_urls
+    urls = normalize_urls(urls)
+    if not source and not urls:
+        raise ValueError('请选择本地资料或填写网页链接。')
     if not customer_id.strip() or not name.strip():
         raise ValueError('客户 ID 和知识库名称不能为空。')
     if not 64 <= chunk_tokens <= 440 or not 0 <= overlap < chunk_tokens // 2:
@@ -245,7 +249,7 @@ def build(source, output, customer_id, encoder, name='客户知识库', chunk_to
     os.close(descriptor)
     temporary = None
     try:
-        base, files, skipped = discover(source, cancel)
+        base, files, skipped = discover(source, cancel) if source else (None, [], [])
         documents, chunks, errors = [], [], []
         for index, path in enumerate(files, 1):
             check_cancel(cancel)
@@ -270,8 +274,22 @@ def build(source, output, customer_id, encoder, name='客户知识库', chunk_to
                 errors.append({'source': relative, 'error': str(exc)})
         if errors:
             raise ValueError('存在无法完整处理的资料，未发布知识包：\n' + json_text(errors))
+        sources = {doc['source'] for doc in documents}
+        for page in fetch_documents(urls, cancel, progress) if urls else ():
+            if page.source in sources:
+                raise ValueError('网页来源与本地文件重名，请重命名本地 web 目录后重试。')
+            parts = make_chunks(text_blocks(page.text, page.metadata['title']), page.source,
+                                encoder, chunk_tokens, overlap)
+            if not parts:
+                raise ValueError('网页没有可索引正文：' + page.metadata['source_url'])
+            documents.append(dict(page.metadata, source=page.source, sha256=digest(page.text), chunks=len(parts)))
+            chunks.extend(parts)
+            if len(chunks) > MAX_CHUNKS:
+                raise ValueError(f'片段总数超过 {MAX_CHUNKS}，请拆分。')
         check_cancel(cancel)
-        fingerprint = digest(json_text({'documents': documents, 'model': encoder.signature,
+        # Capture time describes this snapshot, but is not a content/configuration change.
+        stable_documents = [{k: v for k, v in doc.items() if k != 'fetched_at'} for doc in documents]
+        fingerprint = digest(json_text({'documents': stable_documents, 'model': encoder.signature,
                                        'chunk_tokens': chunk_tokens, 'overlap': overlap,
                                        'name': name, 'customer_id': customer_id, 'pipeline_version': 1}))
         previous, cached = None, {}
@@ -308,6 +326,8 @@ def build(source, output, customer_id, encoder, name='客户知识库', chunk_to
                             '原文和向量未加密，校验不等于发行签名', '不自动生成个人经历或回答',
                             '需使用支持 .wlkb 知识包的闻录版本'],
         }
+        if urls:
+            manifest['limitations'].append('网页为抓取时的正文快照；动态页面可通过后台浏览器加载，不登录、不自动更新；行号为提取正文行号')
         progress('写入知识包…')
         handle, temp_name = tempfile.mkstemp(prefix=output.name + '.', suffix='.tmp', dir=output.parent)
         os.close(handle)
@@ -389,9 +409,13 @@ def search(package, query, encoder, top_k=5, mode='hybrid', customer_id=None, ca
         order = sorted(fused, key=lambda row_id: (-fused[row_id], row_id))[:top_k]
         check_cancel(cancel)
         results = []
+        web_sources = {doc['source']: doc for doc in manifest.get('documents', []) if doc.get('source_url')}
         for row_id in order:
             row = rowmap[row_id]
             item = {key: row[key] for key in ('id', 'source', 'section', 'page', 'line_start', 'line_end', 'text')}
+            if row['source'] in web_sources:
+                doc = web_sources[row['source']]
+                item.update({key: doc[key] for key in ('source_url', 'final_url', 'title', 'fetched_at')})
             item.update(score=fused[row_id], cosine=similarities.get(row_id),
                         semantic_rank=semantic.index(row_id) + 1 if row_id in semantic else None,
                         keyword_rank=keyword.index(row_id) + 1 if row_id in keyword else None)

@@ -10,13 +10,16 @@ from .embedding import DEFAULT_MODEL_DIR, Encoder, prepare_model
 def main():
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
         sys.stderr.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description='闻录独立知识库生成工具：本地 BGE 向量化，不上传资料。')
     parser.add_argument('--model-dir', type=Path, default=DEFAULT_MODEL_DIR)
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('prepare-model', help='下载并校验固定版本的模型（约 24 MB）')
     builder = commands.add_parser('build', help='生成或增量重建 .wlkb 文件')
-    builder.add_argument('--source', type=Path, required=True)
+    builder.add_argument('--source', type=Path, help='本地资料文件或目录，可与网页一起构建')
+    builder.add_argument('--url', action='append', default=[], help='网页完整地址，可重复传入')
+    builder.add_argument('--urls-file', type=Path, help='UTF-8 网址清单，每行一个地址')
     builder.add_argument('--output', type=Path, required=True)
     builder.add_argument('--customer-id', required=True)
     builder.add_argument('--name', default='客户知识库')
@@ -44,11 +47,22 @@ def main():
         elif args.command == 'inspect':
             result = inspect_package(args.package)
         else:
+            urls = []
+            if args.command == 'build':
+                from .web_sources import normalize_urls
+                urls = list(args.url)
+                if args.urls_file:
+                    if args.urls_file.stat().st_size > 200_000:
+                        raise ValueError('网址清单超过 200 KB。')
+                    urls.extend(args.urls_file.read_text(encoding='utf-8-sig').splitlines())
+                urls = normalize_urls(urls)
+                if not args.source and not urls:
+                    raise ValueError('请提供 --source、--url 或 --urls-file。')
             log('加载本地模型…')
             encoder = Encoder(args.model_dir)
             if args.command == 'build':
                 result = build(args.source, args.output, args.customer_id, encoder, name=args.name,
-                               chunk_tokens=args.chunk_tokens, overlap=args.overlap, progress=log)
+                               chunk_tokens=args.chunk_tokens, overlap=args.overlap, progress=log, urls=urls)
             else:
                 result = search(args.package, args.query, encoder, args.top_k, args.mode, args.customer_id)
         print(json.dumps(result, ensure_ascii=False, indent=2))
