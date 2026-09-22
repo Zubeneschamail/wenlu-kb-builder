@@ -1,6 +1,6 @@
 # 闻录独立知识库生成工具
 
-本工具位于 `E:\wenlu-kb-builder`。它与闻录代码、运行环境、打包流程相互独立，不会把 demo 或生成结果加入闻录安装包。
+本工具与闻录代码、运行环境、打包流程相互独立。资料和生成结果不会加入闻录安装包。
 
 选择资料 → 本地解析和切块 → 本地向量化 → 输出 `.wlkb` → 搜索验证。
 
@@ -8,13 +8,13 @@
 
 ## 开始使用
 
-当前机器已经准备好独立环境和模型，双击 **start.cmd** 打开窗口。
+双击 **start.cmd** 打开「闻录 · 知识库」。界面沿用闻录的控件与字体，使用独立的紫色书本图标，便于在任务栏区分；保留资料配置、模型准备、知识包生成和检索功能。
 
 1. 首次使用其他电脑时，安装 Python 3.12，再运行 `setup.cmd`。该步骤安装锁定版本的依赖，并从 Hugging Face 下载约 24 MB 模型。
 2. 在窗口中填写客户 ID、名称，选择一个文件或资料文件夹，指定输出文件。
-3. 点击「生成知识包」，等待日志显示完成。
-4. 输入问题，点击「检索验证」，查看实际匹配的原文和来源。这里不调用大语言模型，不生成问答答案。
-5. 使用「填入虚构样例」可直接选择附带的林舟 demo。只索引 `examples/linzhou/source`，验收题位于独立的 `evaluation` 目录。
+3. 点击「生成知识包」，在进度区查看当前阶段与耗时。解析、向量化和有大小信息的下载显示该阶段的实际进度；总量未知时显示等待动画，不估算总进度。
+4. 输入问题，点击「检索」，在「检索结果」查看匹配原文和来源。已有知识包可通过「打开知识包」直接检索，无需源文件。这里不调用大语言模型，不生成问答答案。
+5. 「运行记录」保留详细日志。可以取消正在进行的任务；失败或取消后明确显示未完成，并恢复操作按钮。模型下载超时时，可通过「离线模型」打开下载页。
 
 模型已就绪后，构建和查询不会访问网络；资料不会上传。默认 CPU 推理，限制为 2 个计算线程，可在编码器初始化参数中调整。
 
@@ -44,18 +44,17 @@ Release 同时提供 `.sha256` 校验文件。ZIP 的 SHA256 为 `409a0f343cfaab
 # 模型只需准备一次；模型损坏时可重新执行。
 .\.venv\Scripts\python.exe -m kbtool prepare-model
 
-# 构建 demo。新客户应使用自己的客户 ID 和输出路径。
-.\.venv\Scripts\python.exe -m kbtool build --source examples\linzhou\source --output output\linzhou-demo.wlkb --customer-id demo-linzhou --name linzhou-demo
+# 构建客户资料；将 source 换成实际资料文件或文件夹。
+.\.venv\Scripts\python.exe -m kbtool build --source source --output output\customer.wlkb --customer-id customer-001 --name "客户知识库"
 
 # 混合检索；也可使用 --mode semantic 或 --mode keyword。
-.\.venv\Scripts\python.exe -m kbtool search --package output\linzhou-demo.wlkb --customer-id demo-linzhou --query "数据库已经更新，但提醒没有发出去怎么办？"
+.\.venv\Scripts\python.exe -m kbtool search --package output\customer.wlkb --customer-id customer-001 --query "项目中如何处理消息发送失败？"
 
 # 不加载模型即可读取包内清单。
-.\.venv\Scripts\python.exe -m kbtool inspect --package output\linzhou-demo.wlkb
+.\.venv\Scripts\python.exe -m kbtool inspect --package output\customer.wlkb
 
-# 实际模型回归测试和 demo 检索评估。
+# 实际模型回归测试。
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe evaluate_demo.py
 ```
 
 命令行结果为 stdout JSON，进度和错误写入 stderr，失败返回非零退出码。门户任务进程可直接调用；当前不包含门户、支付、授权或任务队列服务。使用自定义模型目录时将 `--model-dir 路径` 放在子命令之前；该目录必须包含固定模型文件，并不支持任意不同模型混用。
@@ -106,11 +105,10 @@ Release 同时提供 `.sha256` 校验文件。ZIP 的 SHA256 为 `409a0f343cfaab
 ```text
 kbtool/                 构建、模型、检索、CLI 与窗口代码
 tests/                  使用真实模型的回归测试
-examples/linzhou/source/ 虚构简历与项目资料
-examples/linzhou/evaluation/  独立验收题，不入库
+assets/                 知识库专用图标（SVG、PNG、多尺寸 ICO）
+tools/make_icon.py      图标生成脚本（开发时需 Pillow，运行工具不需要）
 models/                 本机模型文件
 output/                 知识包、构建报告、检索评估报告
 start.cmd               打开窗口
 setup.cmd               新环境安装依赖并准备模型
-build-demo.cmd          构建虚构样例
 ```

@@ -250,7 +250,7 @@ def build(source, output, customer_id, encoder, name='客户知识库', chunk_to
         for index, path in enumerate(files, 1):
             check_cancel(cancel)
             relative = path.relative_to(base).as_posix()
-            progress(f'解析 {index}/{len(files)}：{relative}')
+            progress(f'正在解析：{relative}')
             try:
                 before = sha256(path)
                 parsed = parse_document(path, cancel)
@@ -265,6 +265,7 @@ def build(source, output, customer_id, encoder, name='客户知识库', chunk_to
                 chunks.extend(parts)
                 if len(chunks) > MAX_CHUNKS:
                     raise ValueError(f'片段总数超过 {MAX_CHUNKS}，请拆分。')
+                progress(f'解析完成 {index}/{len(files)}：{relative}')
             except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
                 errors.append({'source': relative, 'error': str(exc)})
         if errors:
@@ -307,6 +308,7 @@ def build(source, output, customer_id, encoder, name='客户知识库', chunk_to
                             '原文和向量未加密，校验不等于发行签名', '不自动生成个人经历或回答',
                             '需使用支持 .wlkb 知识包的闻录版本'],
         }
+        progress('写入知识包…')
         handle, temp_name = tempfile.mkstemp(prefix=output.name + '.', suffix='.tmp', dir=output.parent)
         os.close(handle)
         temporary = Path(temp_name)

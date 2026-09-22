@@ -1,123 +1,243 @@
-"""Tk desktop front end; workers never access Tk widgets."""
+"""Wenlu knowledge builder. Only the UI thread touches Tk widgets."""
 from pathlib import Path
 import queue
+import re
+import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+import webbrowser
 
+from . import ui
+from .scrollbars import SlimScrollbar
 from .core import build, search
-from .embedding import Cancelled, DEFAULT_MODEL_DIR, Encoder, ROOT, prepare_model
+from .embedding import Cancelled, DEFAULT_MODEL_DIR, Encoder, FILES, ROOT, prepare_model, sha256
+
+OFFLINE_RELEASE = 'https://github.com/Zubeneschamail/wenlu-kb-builder/releases/tag/offline-model-bge-zh-v1'
 
 
 class Application:
     def __init__(self, root, model_dir=DEFAULT_MODEL_DIR):
-        self.root, self.model_dir = root, model_dir
+        self.root, self.model_dir = root, Path(model_dir)
         self.events = queue.Queue()
         self.cancel = threading.Event()
-        self.worker = None
-        self.encoder = None
-        root.title('闻录 · 独立知识库生成工具')
-        root.geometry('920x760')
-        root.minsize(760, 620)
-        root.protocol('WM_DELETE_WINDOW', self.close)
-        frame = ttk.Frame(root, padding=18)
-        frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='客户知识库生成工具', font=('Microsoft YaHei UI', 17, 'bold')).pack(anchor='w')
-        ttk.Label(frame, text='本地解析与向量化 · 原文可追溯 · 生成包后可直接试搜').pack(anchor='w', pady=(4, 12))
+        self.worker = self.encoder = self.poll_timer = self.started = self.operation_kind = None
+        self.busy = self.closed = False
+        self.actions, self.controls = [], []
         self.source = tk.StringVar()
         self.output = tk.StringVar(value=str(ROOT / 'output' / 'customer.wlkb'))
         self.customer = tk.StringVar(value='customer-001')
-        self.name = tk.StringVar(value='客户项目知识库')
+        self.name = tk.StringVar(value='客户知识库')
         self.query = tk.StringVar()
-        self.status = tk.StringVar(value='首次使用请准备模型；模型就绪后可离线构建。')
-        self.actions = []
-        self.controls = []
-        form = ttk.Frame(frame)
-        form.pack(fill='x')
-        form.columnconfigure(1, weight=1)
-        for row, (label, variable) in enumerate([('客户 ID', self.customer), ('知识库名称', self.name),
-                                                ('资料文件 / 文件夹', self.source), ('输出知识包', self.output)]):
-            ttk.Label(form, text=label).grid(row=row, column=0, sticky='w', pady=5, padx=(0, 10))
-            entry = ttk.Entry(form, textvariable=variable)
-            entry.grid(row=row, column=1, sticky='ew', pady=5)
-            self.controls.append(entry)
-        pickers = ttk.Frame(form)
-        pickers.grid(row=2, column=2, padx=(8, 0))
-        self.button(pickers, '选文件', self.pick_file).pack(side='left')
-        self.button(pickers, '选文件夹', self.pick_folder).pack(side='left', padx=(4, 0))
-        self.button(form, '选择位置', self.pick_output).grid(row=3, column=2, padx=(8, 0))
-        bar = ttk.Frame(frame)
-        bar.pack(fill='x', pady=12)
-        self.button(bar, '① 准备模型', self.prepare).pack(side='left')
-        self.button(bar, '② 生成知识包', self.generate).pack(side='left', padx=8)
-        self.button(bar, '填入虚构样例', self.demo).pack(side='left')
-        self.cancel_button = ttk.Button(bar, text='取消任务', command=self.cancel.set, state='disabled')
-        self.cancel_button.pack(side='right')
-        self.spinner = ttk.Progressbar(frame, mode='indeterminate')
-        self.spinner.pack(fill='x')
-        ttk.Label(frame, textvariable=self.status, wraplength=820).pack(anchor='w', pady=(4, 10))
-        querybar = ttk.Frame(frame)
-        querybar.pack(fill='x')
-        query_entry = ttk.Entry(querybar, textvariable=self.query)
-        query_entry.pack(side='left', fill='x', expand=True)
-        self.controls.append(query_entry)
-        query_entry.bind('<Return>', lambda _: self.lookup())
-        self.button(querybar, '③ 检索验证', self.lookup).pack(side='left', padx=(8, 0))
-        self.button(querybar, '打开已有包', self.pick_package).pack(side='left', padx=(6, 0))
-        self.display = ScrolledText(frame, wrap='word', font=('Microsoft YaHei UI', 10), state='disabled')
-        self.display.pack(fill='both', expand=True, pady=(10, 0))
-        self.append('只选择资料目录。evaluation、tests、隐藏目录和构建输出目录默认跳过。\n'
-                    '知识包包含原文，不含 API Key；此工具不生成虚构个人经历，也不调用在线问答模型。\n')
-        root.after(100, self.poll)
+        self.status = tk.StringVar(value='选择资料后，开始生成知识包。')
+        self.phase = tk.StringVar(value='准备就绪')
+        self.progress_detail = tk.StringVar(value='')
+        self.elapsed = tk.StringVar(value='')
+        self.model_status = tk.StringVar()
+        ui.setup(root)
+        root.title('闻录 · 知识库')
+        root.geometry(f'960x{min(760, root.winfo_screenheight() - 100)}')
+        root.minsize(860, 680)
+        root.protocol('WM_DELETE_WINDOW', self.close)
+        root.bind('<Destroy>', self.destroyed, add='+')
+        assets = ROOT / 'assets'
+        self.logo = tk.PhotoImage(file=str(assets / 'knowledge-24.png'))
+        self.window_icon = tk.PhotoImage(file=str(assets / 'knowledge-256.png'))
+        root.iconphoto(True, self.window_icon)
+        if sys.platform == 'win32':
+            root.iconbitmap(str(assets / 'knowledge.ico'))
+        self.build_ui()
+        self.refresh_model_status()
+        self.poll_timer = root.after(80, self.poll)
 
-    def button(self, parent, text, command):
-        button = ttk.Button(parent, text=text, command=command)
+    def build_ui(self):
+        page = tk.Frame(self.root, bg=ui.BG, padx=20, pady=16)
+        page.pack(fill='both', expand=True)
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(2, weight=1)
+        header = tk.Frame(page, bg=ui.BG)
+        header.grid(row=0, column=0, sticky='ew', pady=(0, 14))
+        tk.Label(header, image=self.logo, bg=ui.BG, bd=0).pack(side='left', padx=(0, 10))
+        ui.label(header, '知识库', size=14, color=ui.TEXT, bold=True).pack(side='left')
+        ui.label(header, '闻录', size=10, color=ui.MUTED).pack(side='right')
+
+        form = self.card(page, row=1)
+        self.heading(form, '生成知识包', '选择资料，生成 .wlkb 文件')
+        fields = tk.Frame(form, bg=ui.SURFACE)
+        fields.pack(fill='x', pady=(12, 0))
+        fields.columnconfigure(0, minsize=78)
+        fields.columnconfigure(1, weight=1)
+        fields.columnconfigure(2, minsize=168)
+        ui.label(fields, '客户 ID', size=9).grid(row=0, column=0, sticky='w')
+        metadata = tk.Frame(fields, bg=ui.SURFACE)
+        metadata.grid(row=0, column=1, columnspan=2, sticky='ew', pady=(0, 8))
+        metadata.columnconfigure(0, weight=1, uniform='metadata')
+        metadata.columnconfigure(2, weight=1, uniform='metadata')
+        self.customer_entry = self.entry(metadata, self.customer, width=14)
+        self.customer_entry.grid(row=0, column=0, sticky='ew')
+        ui.label(metadata, '知识库名称', size=9).grid(row=0, column=1, padx=(20, 12))
+        self.entry(metadata, self.name, width=16).grid(row=0, column=2, sticky='ew')
+
+        ui.label(fields, '资料位置', size=9).grid(row=1, column=0, sticky='w')
+        self.source_entry = self.entry(fields, self.source)
+        self.source_entry.grid(row=1, column=1, sticky='ew', pady=(0, 8))
+        choices = tk.Frame(fields, bg=ui.SURFACE)
+        choices.grid(row=1, column=2, sticky='nsew', padx=(8, 0), pady=(0, 8))
+        choices.columnconfigure((0, 1), weight=1, uniform='choices')
+        self.button(choices, '文件', self.pick_file).grid(row=0, column=0, sticky='nsew', padx=(0, 4))
+        self.button(choices, '文件夹', self.pick_folder).grid(row=0, column=1, sticky='nsew', padx=(4, 0))
+        choices.rowconfigure(0, weight=1)
+
+        ui.label(fields, '保存位置', size=9).grid(row=2, column=0, sticky='w')
+        self.output_entry = self.entry(fields, self.output)
+        self.output_entry.grid(row=2, column=1, sticky='ew')
+        self.button(fields, '选择位置', self.pick_output).grid(row=2, column=2, sticky='nsew', padx=(8, 0))
+
+        actions = tk.Frame(form, bg=ui.SURFACE)
+        actions.pack(fill='x', pady=(12, 0))
+        self.generate_button = self.button(actions, '生成知识包', self.generate, primary=True)
+        self.generate_button.pack(side='right')
+        self.cancel_button = ui.button(actions, '取消', self.cancel_task)
+        self.cancel_button.configure(state='disabled')
+        self.cancel_button.pack(side='right', padx=(0, 8))
+        self.model_label = ui.label(actions, variable=self.model_status, size=9, color=ui.MUTED)
+        self.model_label.pack(side='left', padx=(0, 12))
+        self.button(actions, '准备模型', self.prepare).pack(side='left')
+        self.button(actions, '离线模型', lambda: webbrowser.open(OFFLINE_RELEASE)).pack(side='left', padx=(8, 0))
+
+        self.spinner = ui.ProgressStrip(form)
+        self.spinner.pack(fill='x', pady=(12, 6))
+        progress = tk.Frame(form, bg=ui.SURFACE)
+        progress.pack(fill='x')
+        self.phase_label = ui.label(progress, variable=self.phase, size=9, color=ui.SECONDARY)
+        self.phase_label.pack(side='left', padx=(0, 12))
+        ui.label(progress, variable=self.elapsed, size=9, color=ui.MUTED).pack(side='right')
+        ui.label(progress, variable=self.progress_detail, size=9, color=ui.ACCENT).pack(side='right', padx=(12, 12))
+        ui.StatusLine(progress, self.status).pack(side='left', fill='x', expand=True)
+
+        retrieval = self.card(page, row=2, top=12)
+        self.heading(retrieval, '检索验证', '查看匹配片段与来源')
+        query_row = tk.Frame(retrieval, bg=ui.SURFACE)
+        query_row.pack(fill='x', pady=(12, 10))
+        self.button(query_row, '打开知识包', self.pick_package).pack(side='right', padx=(8, 0))
+        self.search_button = self.button(query_row, '检索', self.lookup, primary=True)
+        self.search_button.pack(side='right', padx=(8, 0))
+        self.query_entry = self.entry(query_row, self.query)
+        self.query_entry.pack(side='left', fill='x', expand=True)
+        self.query_entry.bind('<Return>', lambda _: self.lookup())
+        self.tabs = ui.FlatTabs(retrieval)
+        self.tabs.pack(fill='both', expand=True)
+        self.result_page, self.results = self.text_page('检索结果')
+        self.log_page, self.display = self.text_page('运行记录')
+        self.set_results('输入问题，检索当前知识包。\n\n已有知识包可直接打开，无需源文件。', empty=True)
+
+    def card(self, parent, row, top=0):
+        border = tk.Frame(parent, bg=ui.SURFACE, bd=0, highlightbackground=ui.BORDER, highlightthickness=1)
+        border.grid(row=row, column=0, sticky='nsew', pady=(top, 0))
+        content = tk.Frame(border, bg=ui.SURFACE, padx=16, pady=14)
+        content.pack(fill='both', expand=True)
+        return content
+
+    def heading(self, parent, title, hint):
+        row = tk.Frame(parent, bg=ui.SURFACE)
+        row.pack(fill='x')
+        ui.label(row, title, size=10, color=ui.TEXT, bold=True).pack(side='left')
+        ui.label(row, hint, size=9, color=ui.MUTED).pack(side='right')
+
+    def entry(self, parent, variable, **kwargs):
+        entry = ttk.Entry(parent, textvariable=variable, style='WL.TEntry', **kwargs)
+        self.controls.append(entry)
+        return entry
+
+    def button(self, parent, text, command, primary=False):
+        button = ui.button(parent, text, command, primary)
         self.actions.append(button)
         return button
+
+    def text_page(self, title):
+        frame = tk.Frame(self.tabs.body, bg=ui.SURFACE, bd=0, highlightthickness=0)
+        text = tk.Text(frame, wrap='word', font=(ui.FONT, 10), bg=ui.SURFACE, fg=ui.SECONDARY,
+                       bd=0, highlightthickness=0, padx=10, pady=12, height=5, spacing1=0, spacing3=2,
+                       selectbackground=ui.HOVER, selectforeground=ui.TEXT, state='disabled')
+        text.pack(side='left', fill='both', expand=True)
+        scrollbar = SlimScrollbar(text, overlay_parent=frame)
+        text._scrollbar = scrollbar
+        text.tag_configure('muted', foreground=ui.MUTED)
+        text.tag_configure('heading', foreground=ui.ACCENT, font=(ui.FONT, 10, 'bold'))
+        self.tabs.add(frame, text=title)
+        return frame, text
 
     def append(self, text):
         self.display.configure(state='normal')
         self.display.insert('end', text + '\n')
+        lines = int(self.display.index('end-1c').split('.')[0])
+        if lines > 1200:
+            self.display.delete('1.0', f'{lines - 1000}.0')
         self.display.see('end')
         self.display.configure(state='disabled')
 
+    def set_results(self, text, empty=False):
+        self.results.configure(state='normal')
+        self.results.delete('1.0', 'end')
+        for line in text.splitlines(keepends=True):
+            tag = 'muted' if empty or line.startswith('找到 ') else 'heading' if re.match(r'^\[\d+\]', line) else ''
+            self.results.insert('end', line, tag)
+        self.results.configure(state='disabled')
+        self.results.yview_moveto(0)
+
+    def refresh_model_status(self):
+        try:
+            ready = all((self.model_dir / name).is_file() and sha256(self.model_dir / name) == expected
+                        for name, expected in FILES.items())
+        except OSError:
+            ready = False
+        self.model_status.set('本地模型就绪' if ready else '模型未就绪')
+        self.model_label.configure(fg='#15803d' if ready else ui.MUTED)
+
     def pick_file(self):
-        value = filedialog.askopenfilename(filetypes=[('支持的资料', '*.txt *.md *.rst *.pdf *.docx')])
+        value = filedialog.askopenfilename(parent=self.root, title='选择资料文件', filetypes=[('支持的资料', '*.txt *.md *.rst *.pdf *.docx')])
         if value:
             self.source.set(value)
 
     def pick_folder(self):
-        value = filedialog.askdirectory()
+        value = filedialog.askdirectory(parent=self.root, title='选择资料文件夹')
         if value:
             self.source.set(value)
 
     def pick_output(self):
-        value = filedialog.asksaveasfilename(defaultextension='.wlkb', filetypes=[('知识包', '*.wlkb')])
+        value = filedialog.asksaveasfilename(parent=self.root, title='保存知识包', defaultextension='.wlkb', filetypes=[('闻录知识包', '*.wlkb')])
         if value:
             self.output.set(value)
 
     def pick_package(self):
-        value = filedialog.askopenfilename(filetypes=[('知识包', '*.wlkb')])
+        value = filedialog.askopenfilename(parent=self.root, title='打开知识包', filetypes=[('闻录知识包', '*.wlkb')])
         if value:
             self.output.set(value)
+            self.status.set(f'已选择 {Path(value).name}，输入问题即可检索。')
+            self.set_results('已切换知识包，请重新检索。', empty=True)
+            self.tabs.select(self.result_page)
+            self.query_entry.focus_set()
 
-    def demo(self):
-        self.source.set(str(ROOT / 'examples' / 'linzhou' / 'source'))
-        self.output.set(str(ROOT / 'output' / 'linzhou-demo.wlkb'))
-        self.customer.set('demo-linzhou')
-        self.name.set('林舟 · 虚构测试资料')
-        self.query.set('数据库已经更新成功，但是通知没有发出去，怎么解决？')
-
-    def run(self, operation):
-        if self.worker and self.worker.is_alive():
+    def run(self, operation, title='正在处理', kind='build'):
+        if self.busy:
             return
+        self.busy = True
+        self.operation_kind = kind
         self.cancel = threading.Event()
+        self.started = time.monotonic()
+        self.elapsed.set('已用时 0 秒')
         for control in self.actions + self.controls:
             control.configure(state='disabled')
         self.cancel_button.configure(state='normal')
-        self.spinner.start()
-        self.status.set('正在处理…')
+        self.set_progress(title)
+        self.status.set(title + '…')
+        self.append('\n' + time.strftime('%H:%M:%S') + '  ' + title)
+        if kind == 'search':
+            self.set_results('正在检索当前知识包…', empty=True)
+            self.tabs.select(self.result_page)
+        else:
+            self.tabs.select(self.log_page)
         def work():
             try:
                 self.events.put(('result', operation()))
@@ -129,6 +249,37 @@ class Application:
                 self.events.put(('done', None))
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
+
+    def set_progress(self, phase, value=None, detail=None, state='running'):
+        self.phase.set(phase)
+        self.spinner.set(state, value)
+        self.progress_detail.set(detail if detail is not None else f'{value:.0%}' if value is not None else '处理中')
+        self.phase_label.configure(fg={'error': '#b91c1c', 'cancelled': '#b45309'}.get(state, ui.TEXT))
+
+    def update_progress(self, text):
+        if self.cancel.is_set():
+            return
+        match = re.search(r'^(解析完成|向量化：)\s*(\d+)/(\d+)', text)
+        download = re.search(r'：([\d.]+) MB / ([\d.]+) MB', text)
+        if match:
+            done, total = int(match[2]), int(match[3])
+            phase = '解析资料' if match[1] == '解析完成' else '生成向量'
+            self.set_progress(phase, done / total if total else 0, f'{done} / {total} · {done / max(total, 1):.0%}')
+        elif download:
+            done, total = float(download[1]), float(download[2])
+            self.set_progress('下载模型', done / total if total else None, f'{done:g} / {total:g} MB')
+        elif text.startswith('下载模型文件'):
+            self.set_progress('下载模型')
+        elif text.startswith('正在解析') and self.phase.get() != '解析资料':
+            self.set_progress('解析资料', 0, '正在读取资料')
+        elif text.startswith('已校验'):
+            self.set_progress('校验模型')
+        elif text.startswith('共 '):
+            self.set_progress('生成向量')
+        elif text.startswith('加载'):
+            self.set_progress('加载模型')
+        elif text.startswith('写入'):
+            self.set_progress('写入知识包')
 
     def log(self, text):
         self.events.put(('log', text))
@@ -143,66 +294,122 @@ class Application:
         def operation():
             prepare_model(self.model_dir, self.log, self.cancel)
             self.encoder = None
-            return '模型已就绪。'
-        self.run(operation)
+            return '模型校验完成，可以生成知识包。'
+        self.run(operation, '准备模型', 'model')
 
     def generate(self):
+        if self.busy:
+            return
         source, output, customer, name = self.source.get().strip(), self.output.get().strip(), self.customer.get().strip(), self.name.get().strip()
         if not source or not output or not customer or not name:
-            messagebox.showerror('信息不完整', '请填写客户 ID、名称、资料和输出位置。')
+            messagebox.showerror('信息不完整', '请填写客户 ID、名称、资料和输出位置。', parent=self.root)
+            return
+        if Path(output).suffix.lower() != '.wlkb':
+            messagebox.showerror('知识包格式错误', '输出知识包的后缀必须为 .wlkb。', parent=self.root)
             return
         def operation():
-            result = build(source, output, customer, self.get_encoder(), name=name,
-                           cancel=self.cancel, progress=self.log)
-            return f'知识包就绪：{result["chunk_count"]} 个片段，版本 {result["version"]}。\n输出：{output}'
-        self.run(operation)
+            result = build(source, output, customer, self.get_encoder(), name=name, cancel=self.cancel, progress=self.log)
+            return f'知识包已生成 · {result["chunk_count"]} 个片段 · 版本 {result["version"]}\n{output}'
+        self.run(operation, '生成知识包', 'build')
 
     def lookup(self):
+        if self.busy:
+            return
         package, query = self.output.get().strip(), self.query.get().strip()
         if not package or not query:
-            messagebox.showerror('信息不完整', '请选择知识包并输入检索问题。')
+            messagebox.showerror('信息不完整', '请选择知识包并输入检索问题。', parent=self.root)
             return
+        path = Path(package)
+        if path.suffix.lower() == '.wldb' and path.with_suffix('.wlkb').is_file():
+            path = path.with_suffix('.wlkb')
+            self.output.set(str(path))
+            self.append(f'知识包后缀已纠正为 .wlkb：{path}')
+        if path.suffix.lower() != '.wlkb':
+            messagebox.showerror('知识包格式错误', '请选择 .wlkb 知识包，可点击「打开知识包」重新选择。', parent=self.root)
+            return
+        if not path.is_file():
+            messagebox.showerror('知识包不存在', f'找不到知识包：{path}\n请点击「打开知识包」选择已生成的 .wlkb 文件。', parent=self.root)
+            return
+        package = str(path)
         def operation():
             result = search(package, query, self.get_encoder(), cancel=self.cancel)
-            sections = [f'检索：{query}\n客户：{result["customer_id"]}']
+            sections = [f'找到 {len(result["matches"])} 个相关片段 · 客户 {result["customer_id"]}']
             for i, item in enumerate(result['matches'], 1):
                 location = f'第 {item["page"]} 页，' if item['page'] else ''
-                sections.append(f'\n[{i}] {item["source"]} · {location}行 {item["line_start"]}—{item["line_end"]}\n'
-                                f'{item["section"]}\n{item["text"]}')
-            return '\n'.join(sections) + '\n\n' + result['note']
-        self.run(operation)
+                sections.append(f'[{i}] {item["section"]}\n{item["source"]} · {location}行 {item["line_start"]}—{item["line_end"]}\n{item["text"]}')
+            return '\n\n'.join(sections) + '\n\n' + result['note']
+        self.run(operation, '检索知识包', 'search')
+
+    def cancel_task(self):
+        if self.busy:
+            self.cancel.set()
+            self.cancel_button.configure(state='disabled')
+            self.set_progress('正在取消', detail='等待当前步骤结束')
+            self.status.set('正在停止任务，请稍候。')
 
     def poll(self):
+        self.poll_timer = None
+        if self.closed:
+            return
+        if self.busy and self.started is not None:
+            self.elapsed.set(f'已用时 {time.monotonic() - self.started:.0f} 秒')
         try:
-            while True:
+            for _ in range(100):
                 event, value = self.events.get_nowait()
                 if event == 'done':
+                    self.busy = False
                     self.spinner.stop()
                     self.cancel_button.configure(state='disabled')
                     for control in self.actions + self.controls:
                         control.configure(state='normal')
+                    if self.operation_kind == 'model':
+                        self.refresh_model_status()
                 elif event == 'log':
                     self.status.set(value)
+                    self.update_progress(value)
                     self.append(value)
-                elif event == 'error':
-                    self.status.set('任务失败，详见下方原因。')
-                    self.append('错误：' + value)
-                else:
-                    self.status.set('已取消。' if event == 'cancelled' else '任务完成。')
-                    self.append(value)
+                elif event in ('error', 'cancelled'):
+                    title = '任务失败' if event == 'error' else '任务已取消'
+                    self.set_progress(title, self.spinner.value, detail='未完成', state=event)
+                    self.status.set('模型下载超时，可使用「离线模型包」。' if 'timed out' in value.lower() else value)
+                    self.append(('错误：' if event == 'error' else '已取消：') + value)
+                    if self.operation_kind == 'search':
+                        self.set_results(title + '，请查看运行记录。', empty=True)
+                    self.tabs.select(self.log_page)
+                elif event == 'result':
+                    self.set_progress('检索完成' if self.operation_kind == 'search' else '任务完成', 1, state='success')
+                    if self.operation_kind == 'search':
+                        self.set_results(value)
+                        self.status.set('已返回匹配片段，来源见下方检索结果。')
+                        self.append('检索完成。')
+                        self.tabs.select(self.result_page)
+                    else:
+                        self.status.set(value.splitlines()[0])
+                        self.append(value)
         except queue.Empty:
             pass
-        self.root.after(100, self.poll)
+        self.poll_timer = self.root.after(80, self.poll)
+
+    def destroyed(self, event):
+        if event.widget is self.root:
+            self.closed = True
+            self.cancel.set()
+            if self.poll_timer is not None:
+                self.root.after_cancel(self.poll_timer)
+                self.poll_timer = None
 
     def close(self):
-        if self.worker and self.worker.is_alive():
-            self.cancel.set()
+        if self.busy:
+            self.cancel_task()
             self.status.set('正在取消，请任务结束后关闭窗口。')
             return
         self.root.destroy()
 
 
 def launch(model_dir=DEFAULT_MODEL_DIR):
+    if sys.platform == 'win32':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Wenlu.KnowledgeBuilder')
     root = tk.Tk()
     Application(root, model_dir)
     root.mainloop()

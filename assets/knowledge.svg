@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <title>闻录知识库 — 独立书本标识</title>
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="128" gradientUnits="userSpaceOnUse"><stop stop-color="#8270F5"/><stop offset="1" stop-color="#4E43BF"/></linearGradient></defs>
+  <rect x="4" y="4" width="120" height="120" rx="27" fill="url(#bg)"/>
+  <g transform="translate(0 3)" fill="#4438A7"><path d="M 26 35 C 38 31 52 33 64 41 L 64 99 C 52 91 38 87 26 92 C 24 93 22 91 22 88 L 22 41 C 22 38 23 36 26 35 Z"/><path d="M 102 35 C 90 31 76 33 64 41 L 64 99 C 76 91 90 87 102 92 C 104 93 106 91 106 88 L 106 41 C 106 38 105 36 102 35 Z"/></g>
+  <path d="M 26 35 C 38 31 52 33 64 41 L 64 99 C 52 91 38 87 26 92 C 24 93 22 91 22 88 L 22 41 C 22 38 23 36 26 35 Z" fill="white"/>
+  <path d="M 102 35 C 90 31 76 33 64 41 L 64 99 C 76 91 90 87 102 92 C 104 93 106 91 106 88 L 106 41 C 106 38 105 36 102 35 Z" fill="#EAE7FF"/>
+  <path d="M64 42V96" stroke="#B1A7EE" stroke-width="2" stroke-linecap="round"/>
+  <path d="M33 48L44 49L53 52M33 60L44 61L53 64M75 52L84 49L95 48M75 64L84 61L95 60" stroke="#9286D8" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M82 34L91 33V47L86.5 44L82 48Z" fill="#5D50C3"/>
+</svg>
